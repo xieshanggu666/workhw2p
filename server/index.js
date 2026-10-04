@@ -74,6 +74,14 @@ import {
   listSales as listPartnerSales, listSettlements, settlementDetail, listFines,
   partnerStats, PARTNER_CONST
 } from './partners.js'
+import {
+  initGiftContext,
+  createFamily, inviteFamily, leaveFamily, removeFamilyMember, dissolveFamily,
+  listFamilies, familyDetail,
+  applyGift, cancelGiftApplication, approveGift, rejectGift, claimGift, declineGift, recallGift,
+  sweepExpiredGifts, reconcileGifts,
+  listGifts, giftDetail, claimableGiftsFor, giftStats, getGiftConfig, saveGiftConfig
+} from './gifts.js'
 
 const app = express()
 app.use(express.json())
@@ -167,6 +175,11 @@ initPartnerContext({
 })
 // 设施域服务：时钟 / 现金 / 财务流水（升级扣款与流水同事务原子提交）
 initRideContext({ logFinance })
+// 权益转赠与家庭账户：撤回已用于在途预约的转赠权益时，同事务园方原因取消预约
+// （refundReservation 内层 tx 并入外层事务；全额退款、释放名额，会员侧积分回退/券返还联动作用于受赠人）
+initGiftContext({
+  cancelReservationPark: (reservationId, note) => refundReservation(reservationId, 'park', note)
+})
 // 预约 ↔ 会员双向联动：预约侧注入会员报价/下单/退款回调；会员侧绑定会员模拟下单入口
 initReservationContext({
   quoteReservation: (...args) => memberQuote(...args),
@@ -707,6 +720,13 @@ function tick() {
         .run(state.tick(), day, 'member', '会员卡集中到期',
           `日结扫描发现 ${expiredCards} 张会员卡已过有效期，已自动降级为普通会员（积分与储值余额保留）。会员专员可跟进续费转化。`, 0, 'resolved')
     }
+    // 权益转赠日结扫描：超过领取有效期未领取的转赠自动回补捐赠人（积分/储值/券同口径返还）
+    const expiredGifts = sweepExpiredGifts(day + 1)
+    if (expiredGifts > 0) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'member', '转赠权益到期未领自动回补',
+          `日结扫描发现 ${expiredGifts} 笔权益转赠超过领取有效期未被领取，已自动回补捐赠人（积分/储值/券按原口径返还，家庭共享池转赠同步处理）。`, 0, 'resolved')
+    }
     day += 1
     setSetting('day', day)
     // 统一客流闭环：新一天首个 tick 对「刚结束的一天」回填实际客流、计算预测命中率并学习散客外推系数。
@@ -950,6 +970,34 @@ function tick() {
       }
     }
   } catch (e) { console.error('[flow] 闭环一致性巡检失败:', e) }
+
+  // 权益转赠一致性巡检：锁定权益残留自动解锁；已领取转赠明细缺失仅告警待人工核对
+  try {
+    const gr = reconcileGifts()
+    if (gr.healedCount > 0 || gr.findings.length) {
+      tx(() => {
+        for (const h of gr.healed) {
+          db.prepare(`INSERT INTO reconcile_findings(code,kind,level,ref_type,ref_id,day,title,detail,expected,actual,status,tick,created_day,heal_tick)
+                      VALUES(?,?, 'warn', 'member_benefit',NULL,?,?,?, '{}','{}', 'healed', ?, ?, ?)`)
+            .run('', h.kind, day, h.title, h.detail, state.tick(), day, state.tick())
+          const id = db.prepare('SELECT last_insert_rowid id FROM reconcile_findings').get().id
+          db.prepare('UPDATE reconcile_findings SET code=? WHERE id=?').run('RC' + String(id).padStart(4, '0'), id)
+        }
+        for (const f of gr.findings) {
+          const dup = db.prepare("SELECT id FROM reconcile_findings WHERE kind=? AND ref_id=? AND status='open'").get(f.kind, f.ref)
+          if (dup) continue
+          db.prepare(`INSERT INTO reconcile_findings(code,kind,level,ref_type,ref_id,day,title,detail,expected,actual,status,tick,created_day)
+                      VALUES(?,?,?,?,?,?,?,?,?, '{}','{}','open',?,?)`)
+            .run('', f.kind, f.level, 'gift', f.ref, day,
+              `转赠单 #${f.gift} 明细与受赠权益不一致`,
+              '已领取的转赠明细缺少受赠人权益记录，可能存在权益流失，请人工核对（系统不擅自改写权益）',
+              state.tick(), day)
+          const id = db.prepare('SELECT last_insert_rowid id FROM reconcile_findings').get().id
+          db.prepare('UPDATE reconcile_findings SET code=? WHERE id=?').run('RC' + String(id).padStart(4, '0'), id)
+        }
+      })
+    }
+  } catch (e) { console.error('[gifts] 转赠一致性巡检失败:', e) }
 }
 
 function computeSatisfaction(reserved = 0, total = 0) {
@@ -1124,6 +1172,11 @@ app.get('/api/state', (req, res) => {
     partnerSales: listPartnerSales({ limit: 60 }),
     partnerSettlements: listSettlements({ limit: 50 }),
     partnerConst: { periodChoices: PARTNER_CONST.PERIOD_CHOICES, fineMul: PARTNER_CONST.FINE_MUL, fineMin: PARTNER_CONST.FINE_MIN },
+    // 会员权益转赠与家庭账户
+    giftStats: giftStats(),
+    giftConfig: getGiftConfig(),
+    families: listFamilies({ limit: 100 }),
+    gifts: listGifts({ limit: 120 }),
     avgs: {
       satisfaction: computeSatisfaction(),
       openRatio: rides.length ? operatingRides().length / rides.length : 0
@@ -2216,6 +2269,130 @@ app.post('/api/member-config', (req, res) => {
 // 卡种运营配置（价格/有效期/折扣/赠送/上下架）
 app.post('/api/card-products/:tier', (req, res) => {
   reply(req, res, updateCardProduct(String(req.params.tier), req.body || {}))
+})
+
+// ---- 会员权益转赠与家庭账户（会员 / 受赠人 / 运营三方协作） ----
+// 家庭账户
+app.get('/api/families', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    ok: true,
+    list: listFamilies({ status: q.status || null, memberId: q.member_id ? num(q.member_id) : null, q: q.q || '' }),
+    stats: giftStats(),
+    config: getGiftConfig()
+  })
+})
+app.get('/api/families/:id', (req, res) => {
+  const d = familyDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '家庭账户不存在' })
+  res.json({ ok: true, data: d })
+})
+app.post('/api/families', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createFamily({ memberId: num(b.member_id), name: b.name || '', note: b.note || '' }), 201)
+})
+app.post('/api/families/:id/invite', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, inviteFamily({
+    familyId: num(req.params.id), memberId: num(b.member_id),
+    actorMemberId: b.actor_member_id ? num(b.actor_member_id) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+app.post('/api/families/:id/leave', (req, res) => {
+  reply(req, res, leaveFamily({ familyId: num(req.params.id), memberId: num(req.body?.member_id) }))
+})
+app.post('/api/families/:id/remove', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, removeFamilyMember({
+    familyId: num(req.params.id), memberId: num(b.member_id),
+    actorMemberId: b.actor_member_id ? num(b.actor_member_id) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+app.post('/api/families/:id/dissolve', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, dissolveFamily({
+    familyId: num(req.params.id),
+    actorMemberId: b.actor_member_id ? num(b.actor_member_id) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+
+// 权益转赠单
+app.get('/api/gifts', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    ok: true,
+    list: listGifts({
+      status: q.status || null,
+      donorMemberId: q.donor_id ? num(q.donor_id) : null,
+      recipientMemberId: q.recipient_id ? num(q.recipient_id) : null,
+      familyId: q.family_id ? num(q.family_id) : null,
+      q: q.q || ''
+    }),
+    stats: giftStats(),
+    config: getGiftConfig()
+  })
+})
+app.get('/api/gifts/:id', (req, res) => {
+  const d = giftDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '转赠单不存在' })
+  res.json({ ok: true, data: d })
+})
+
+// 会员发起转赠（幂等）：指定受赠人或家庭共享池；券类传 benefit_ids，积分/储值传 amount
+app.post('/api/gifts', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, applyGift({
+    donorMemberId: num(b.donor_member_id),
+    target: b.target === 'family' ? 'family' : 'member',
+    recipientMemberId: b.recipient_member_id ? num(b.recipient_member_id) : null,
+    familyId: b.family_id ? num(b.family_id) : null,
+    kind: String(b.kind || ''),
+    amount: num(b.amount),
+    benefitIds: b.benefit_ids || [],
+    reason: String(b.reason || ''),
+    requestId: idemKey(req)
+  }), 201)
+})
+// 捐赠人撤回待审核申请
+app.post('/api/gifts/:id/cancel', (req, res) => {
+  reply(req, res, cancelGiftApplication({
+    giftId: num(req.params.id), donorMemberId: num(req.body?.donor_member_id), requestId: idemKey(req)
+  }))
+})
+// 运营审核通过 / 驳回
+app.post('/api/gifts/:id/approve', (req, res) => {
+  reply(req, res, approveGift({ giftId: num(req.params.id), staffId: num(req.body?.staff_id) || null, requestId: idemKey(req) }))
+})
+app.post('/api/gifts/:id/reject', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, rejectGift({
+    giftId: num(req.params.id), staffId: num(b.staff_id) || null, reason: String(b.reason || ''), requestId: idemKey(req)
+  }))
+})
+// 受赠人领取（家庭池任意在组成员可领）/ 指定受赠人拒绝
+app.post('/api/gifts/:id/claim', (req, res) => {
+  reply(req, res, claimGift({ giftId: num(req.params.id), memberId: num(req.body?.member_id), requestId: idemKey(req) }))
+})
+app.post('/api/gifts/:id/decline', (req, res) => {
+  reply(req, res, declineGift({ giftId: num(req.params.id), memberId: num(req.body?.member_id), requestId: idemKey(req) }))
+})
+// 捐赠人 / 运营撤回（已领取的未用权益冲回；已在途预约原子取消退款释放名额）
+app.post('/api/gifts/:id/recall', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, recallGift({
+    giftId: num(req.params.id),
+    donorMemberId: b.donor_member_id ? num(b.donor_member_id) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    reason: String(b.reason || ''),
+    requestId: idemKey(req)
+  }))
+})
+// 转赠运营配置：模块开关 / 家庭池免审 / 领取有效期 / 单笔张数 / 最低转赠等级
+app.post('/api/gift-config', (req, res) => {
+  reply(req, res, saveGiftConfig(req.body || {}))
 })
 
 // ---------------- 园区应急指挥：安全事件 发现→分级→封控→疏散→复园→复盘 ----------------

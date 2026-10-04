@@ -12,6 +12,7 @@ import SchedulingView from '@/components/SchedulingView.vue'
 import ClosedLoopView from '@/components/ClosedLoopView.vue'
 import TicketView from '@/components/TicketView.vue'
 import MembersView from '@/components/MembersView.vue'
+import GiftView from '@/components/GiftView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
 import GroupsView from '@/components/GroupsView.vue'
 import EventsView from '@/components/EventsView.vue'
@@ -34,6 +35,7 @@ const navs = [
   { k: 'closedloop', icon: '🔄', label: '客流调度闭环' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'members', icon: '💎', label: '会员权益' },
+  { k: 'gifts', icon: '🎁', label: '转赠·家庭账户' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
   { k: 'groups', icon: '🧑‍✈️', label: '领队组团' },
   { k: 'events', icon: '🎆', label: '活动事件' },
@@ -91,6 +93,8 @@ onMounted(store.refresh)
           <span class="halo red" v-if="store.incidentStats.open">🚨 {{ store.incidentStats.open }} 起安全事件应急中</span>
           <span class="halo" v-if="store.incidentStats.pendingClaims">🩹 {{ store.incidentStats.pendingClaims }} 笔游客理赔待核定</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
+          <span class="halo" v-if="store.giftStats.pendingReview">🎁 {{ store.giftStats.pendingReview }} 笔权益转赠待审核</span>
+          <span class="halo red" v-if="store.giftStats.expiredClaim">⏰ {{ store.giftStats.expiredClaim }} 笔转赠待领取即将到期</span>
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
@@ -112,6 +116,7 @@ onMounted(store.refresh)
         <ClosedLoopView v-else-if="view === 'closedloop'" />
         <TicketView v-else-if="view === 'ticket'" />
         <MembersView v-else-if="view === 'members'" />
+        <GiftView v-else-if="view === 'gifts'" />
         <ReservationsView v-else-if="view === 'reservations'" />
         <GroupsView v-else-if="view === 'groups'" />
         <EventsView v-else-if="view === 'events'" />

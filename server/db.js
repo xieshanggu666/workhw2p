@@ -1155,6 +1155,125 @@ CREATE TABLE IF NOT EXISTS partner_logs (
   staff_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_plogs_ref ON partner_logs(ref_type,ref_id);
+
+-- ========================================================================
+-- 会员权益转赠与家庭账户：
+--   会员发起转赠（指定受赠人 / 家庭共享池）→ 运营审核 → 发放（受赠人待领取 / 家庭池待领）
+--   → 受赠人领取入账 → 预约/商铺核销 → 捐赠人/运营撤回（未用返还、已用冲积分/储值）
+--   → 受赠人拒绝 / 到期未领自动回补；同步预约名额取消、退款权益返还与积分回退。
+-- 权益券类（免票券/消费券/快速通行券）逐张锁定转移；积分/储值申请即托管，审核发放后入受赠人账户。
+-- ========================================================================
+
+-- 家庭账户（家庭组）：一名会员为户主创建，组员为注册会员；家庭共享池转赠仅同组可领
+CREATE TABLE IF NOT EXISTS family_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',            -- JT0001
+  name TEXT NOT NULL,                       -- 家庭名称
+  head_member_id INTEGER NOT NULL,          -- 户主会员
+  status TEXT NOT NULL DEFAULT 'active',    -- active 正常 / dissolved 已解散
+  member_count INTEGER NOT NULL DEFAULT 1,
+  note TEXT NOT NULL DEFAULT '',
+  create_day INTEGER NOT NULL DEFAULT 0,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  dissolve_day INTEGER NOT NULL DEFAULT 0,
+  dissolve_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_family_head ON family_groups(head_member_id,status);
+
+-- 家庭成员：一名会员同一时刻仅可在一个家庭（部分唯一索引）；户主不可移除/退出
+CREATE TABLE IF NOT EXISTS family_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  family_id INTEGER NOT NULL,
+  member_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',      -- head 户主 / member 成员
+  status TEXT NOT NULL DEFAULT 'active',    -- active 在组 / left 已退出/被移除
+  join_day INTEGER NOT NULL DEFAULT 0,
+  join_tick INTEGER NOT NULL DEFAULT 0,
+  leave_day INTEGER NOT NULL DEFAULT 0,
+  leave_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fmember_one ON family_members(member_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_fmember_family ON family_members(family_id,status);
+
+-- 家庭账户时间线（建组/邀请/入组/退出/移除/解散）
+CREATE TABLE IF NOT EXISTS family_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  family_id INTEGER NOT NULL,
+  member_id INTEGER,                        -- 关联动作会员（加入/退出者）
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,                     -- create/invite/join/leave/remove/dissolve
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_family_logs ON family_logs(family_id);
+
+-- 权益转赠单：捐赠人申请 → 运营审核 → 发放 → 受赠人领取/拒绝 → 核销/撤回/过期回补
+CREATE TABLE IF NOT EXISTS member_gifts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',            -- ZZ0001
+  donor_member_id INTEGER NOT NULL,         -- 捐赠会员
+  recipient_member_id INTEGER,              -- 指定受赠人（家庭共享池为 NULL，池内成员先领先得）
+  family_id INTEGER,                        -- target=family 时关联家庭组
+  target TEXT NOT NULL DEFAULT 'member',    -- member 指定受赠人 / family 家庭共享池
+  kind TEXT NOT NULL,                       -- points 积分 / balance 储值 / ticket 免票券 / voucher 消费券 / fastpass 快速通行券
+  qty INTEGER NOT NULL DEFAULT 1,           -- 券类张数（积分/储值恒 1）
+  amount INTEGER NOT NULL DEFAULT 0,        -- 积分数量 / 储值面额（券类为 0；消费券为张面额×张数冗余便于统计）
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending/approved/claimed/declined/rejected/cancelled/recalled/expired
+  auto_approved INTEGER NOT NULL DEFAULT 0, -- 家庭池自动审核（免审）
+  claim_deadline_day INTEGER NOT NULL DEFAULT 0, -- 领取有效期（发放后 N 游戏日，到期未领自动回补）
+  reason TEXT NOT NULL DEFAULT '',          -- 捐赠人留言
+  reject_reason TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER,                         -- 审核/撤回经办运营
+  benefit_count INTEGER NOT NULL DEFAULT 0, -- 券类明细条数
+  create_day INTEGER NOT NULL DEFAULT 0,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  review_day INTEGER NOT NULL DEFAULT 0,
+  review_tick INTEGER NOT NULL DEFAULT 0,
+  claim_day INTEGER NOT NULL DEFAULT 0,
+  claim_tick INTEGER NOT NULL DEFAULT 0,
+  close_day INTEGER NOT NULL DEFAULT 0,
+  close_tick INTEGER NOT NULL DEFAULT 0,
+  close_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gifts_status ON member_gifts(status,target);
+CREATE INDEX IF NOT EXISTS idx_gifts_donor ON member_gifts(donor_member_id,id);
+CREATE INDEX IF NOT EXISTS idx_gifts_recipient ON member_gifts(recipient_member_id,status);
+CREATE INDEX IF NOT EXISTS idx_gifts_family ON member_gifts(family_id,status);
+
+-- 转赠明细：券类逐张锁定（locked）→ 发放后原权益标记 gifted 转移到受赠人名下；撤回时原权益解锁返还
+-- 积分/储值不产生权益明细（gifted_benefit_id 为发放到受赠人账户的新权益/流水引用，仅券类）
+CREATE TABLE IF NOT EXISTS member_gift_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  gift_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  benefit_id INTEGER NOT NULL,              -- 捐赠人被锁定的原始权益 id（member_benefits.id）
+  gifted_benefit_id INTEGER,                -- 发放后受赠人名下的新权益 id
+  amount INTEGER NOT NULL DEFAULT 0,        -- 该张面额（消费券）
+  status TEXT NOT NULL DEFAULT 'locked',    -- locked 待审核锁定 / gifted 已转移待领取/已领取 / returned 撤回/拒绝/过期已返还捐赠人
+  reservation_id INTEGER,                   -- 受赠人领取后用该权益预约的在途预约（撤回时联动取消）
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gift_items_gift ON member_gift_items(gift_id,seq);
+CREATE INDEX IF NOT EXISTS idx_gift_items_benefit ON member_gift_items(benefit_id);
+CREATE INDEX IF NOT EXISTS idx_gift_items_gifted ON member_gift_items(gifted_benefit_id);
+
+-- 转赠全生命周期时间线（申请/撤回申请/审核通过/驳回/自动审核/领取/拒绝/运营撤回/捐赠人撤回/过期回补/预约联动）
+CREATE TABLE IF NOT EXISTS member_gift_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  gift_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,     -- apply/cancel/approve/auto_approve/reject/claim/decline/recall/expire/reservation_cancel
+  actor_role TEXT NOT NULL DEFAULT 'operations', -- donor/recipient/operations/system
+  actor_member_id INTEGER,
+  staff_id INTEGER,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gift_logs_gift ON member_gift_logs(gift_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -1175,6 +1294,10 @@ ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'
 ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
 // 领队组团：source='group' 的预约单关联团行程明细 id（款项走团账，该预约 amount 恒为 0）
 ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
+// 权益转赠：权益锁定/转移/返还溯源（locked 申请待审锁定；gifted 已随转赠单转移到受赠人名下）
+ensureColumn('member_benefits', 'gift_item_id', "gift_item_id INTEGER")  // 关联 member_gift_items.id（锁定/新权益均回填）
+ensureColumn('member_benefits', 'gift_id', "gift_id INTEGER")            // 关联转赠单 member_gifts.id
+ensureColumn('member_benefits', 'origin_member_id', "origin_member_id INTEGER") // 受赠权益的原始捐赠人（转入新权益记录）
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -1309,6 +1432,12 @@ function seed() {
   setIf('pointsComp', 300)                 // 投诉积分补偿档：结案赠送积分
   setIf('voucherFace', 30)                 // 消费券面额（¥）
   setIf('benefitValidDays', 30)            // 兑换/赠送券类权益有效期（游戏日）
+  // 权益转赠与家庭账户参数
+  setIf('giftEnabled', 1)                  // 转赠模块开关
+  setIf('giftFamilyAutoApprove', 1)        // 家庭共享池转赠是否免审自动通过（1=自动）
+  setIf('giftClaimDays', 7)                // 发放后受赠人领取有效期（游戏日，到期未领自动回补）
+  setIf('giftMaxItems', 20)                // 单笔转赠券类最多张数
+  setIf('giftMinTier', 'none')             // 允许发起转赠的最低卡等级（none/silver/gold/diamond）
 
   const ic = db.prepare(`INSERT OR IGNORE INTO card_products
       (tier,name,price,valid_days,point_mul,discount_entry,discount_ride,discount_vendor,give_ticket,give_voucher,give_fastpass,bonus_points,sort)

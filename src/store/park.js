@@ -72,6 +72,13 @@ function emptyProcurementStats() {
   }
 }
 
+function emptyGiftStats() {
+  return {
+    pendingReview: 0, awaitingClaim: 0, expiredClaim: 0, claimedToday: 0, recalledToday: 0,
+    claimedTotal: 0, familyActive: 0, familyMembers: 0, escrowPoints: 0, escrowBalance: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -146,7 +153,12 @@ export const useParkStore = defineStore('park', {
     partnerContracts: s => s.data?.partnerContracts || [],
     partnerSales: s => s.data?.partnerSales || [],
     partnerSettlements: s => s.data?.partnerSettlements || [],
-    partnerConst: s => s.data?.partnerConst || { periodChoices: [3, 7, 15, 30] }
+    partnerConst: s => s.data?.partnerConst || { periodChoices: [3, 7, 15, 30] },
+    // 权益转赠与家庭账户
+    families: s => s.data?.families || [],
+    gifts: s => s.data?.gifts || [],
+    giftStats: s => s.data?.giftStats || emptyGiftStats(),
+    giftConfig: s => s.data?.giftConfig || { enabled: true, familyAutoApprove: 1, claimDays: 7, maxItems: 20, minTier: 'none' }
   },
   actions: {
     async refresh() {
@@ -303,6 +315,22 @@ export const useParkStore = defineStore('park', {
     async partnerApplicationDetail(id) { return j('GET', `/partner/applications/${id}`) },
     async partnerContractDetail(id) { return j('GET', `/partner/contracts/${id}`) },
     async partnerSettlementDetail(id) { return j('GET', `/partner/settlements/${id}`) },
-    async partnerSalesList(query = '') { return j('GET', `/partner/sales${query}`) }
+    async partnerSalesList(query = '') { return j('GET', `/partner/sales${query}`) },
+    // 会员权益转赠与家庭账户
+    createFamily(payload) { return this.api('POST', '/families', payload) },
+    inviteFamily(id, payload) { return this.api('POST', `/families/${id}/invite`, payload) },
+    leaveFamily(id, member_id) { return this.api('POST', `/families/${id}/leave`, { member_id }) },
+    removeFamilyMember(id, payload) { return this.api('POST', `/families/${id}/remove`, payload) },
+    dissolveFamily(id, payload) { return this.api('POST', `/families/${id}/dissolve`, payload) },
+    async familyDetail(id) { return j('GET', `/families/${id}`) },
+    applyGift(payload) { return this.api('POST', '/gifts', payload) },
+    cancelGift(id, donor_member_id) { return this.api('POST', `/gifts/${id}/cancel`, { donor_member_id, request_id: newRequestId() }) },
+    approveGift(id, staff_id) { return this.api('POST', `/gifts/${id}/approve`, { staff_id, request_id: newRequestId() }) },
+    rejectGift(id, payload) { return this.api('POST', `/gifts/${id}/reject`, { ...payload, request_id: newRequestId() }) },
+    claimGift(id, member_id) { return this.api('POST', `/gifts/${id}/claim`, { member_id, request_id: newRequestId() }) },
+    declineGift(id, member_id) { return this.api('POST', `/gifts/${id}/decline`, { member_id, request_id: newRequestId() }) },
+    recallGift(id, payload) { return this.api('POST', `/gifts/${id}/recall`, { ...payload, request_id: newRequestId() }) },
+    saveGiftConfig(payload) { return this.api('POST', '/gift-config', payload) },
+    async giftDetail(id) { return j('GET', `/gifts/${id}`) }
   }
 })
